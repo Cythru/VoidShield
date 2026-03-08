@@ -1,0 +1,28 @@
+[package]
+name = "voidshield"
+version = "0.1.0"
+edition = "2021"
+description = "Next-gen antivirus engine — Rust/C++/Zig hybrid"
+
+[dependencies]
+aho-corasick = "1"          # Multi-pattern signature matching
+walkdir = "2"               # Recursive directory traversal
+memmap2 = "0.9"             # Memory-mapped file scanning
+sha2 = "0.10"               # SHA-256 file hashing
+md-5 = "0.10"               # MD5 hashing (ClamAV compat)
+hex = "0.4"                 # Hex encoding for hashes
+rayon = "1.10"              # Parallel scanning
+clap = { version = "4", features = ["derive"] }  # CLI
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+flate2 = "1"                # Gzip decompression for sig updates
+reqwest = { version = "0.12", features = ["blocking"] }  # HTTP for sig downloads
+notify = "7"                # Filesystem watcher (real-time)
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
