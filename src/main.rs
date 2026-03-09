@@ -9,8 +9,10 @@
 //!   voidshield quarantine restore  Restore a quarantined file
 
 mod firewall;
+mod oracle;
 mod quarantine;
 mod realtime;
+mod sandbox;
 mod scanner;
 mod signatures;
 
@@ -65,6 +67,48 @@ enum Commands {
     Firewall {
         #[command(subcommand)]
         action: FirewallAction,
+    },
+    /// Ask God to judge a file (LLM-powered threat analysis)
+    Oracle {
+        /// File to judge
+        path: String,
+        /// LLM endpoint URL (default: http://127.0.0.1:9000)
+        #[arg(long, default_value = "http://127.0.0.1:9000")]
+        llm_url: String,
+        /// LLM model name
+        #[arg(long, default_value = "voidminillama")]
+        model: String,
+    },
+    /// Detonate a file in a sandbox and observe its behavior
+    Sandbox {
+        /// File to detonate
+        path: String,
+        /// Execution timeout in seconds
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+        /// Allow network access (DANGEROUS — only for controlled testing)
+        #[arg(long)]
+        allow_network: bool,
+        /// Also consult God about the sandbox results
+        #[arg(long)]
+        god_mode: bool,
+        /// LLM endpoint URL (only used with --god-mode)
+        #[arg(long, default_value = "http://127.0.0.1:9000")]
+        llm_url: String,
+    },
+    /// Full scan with God Mode enabled (LLM judges every suspicious file)
+    GodScan {
+        /// Path to scan
+        path: String,
+        /// LLM endpoint URL
+        #[arg(long, default_value = "http://127.0.0.1:9000")]
+        llm_url: String,
+        /// LLM model name
+        #[arg(long, default_value = "voidminillama")]
+        model: String,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -155,6 +199,24 @@ fn main() {
         Commands::Quarantine { action } => cmd_quarantine(action),
         Commands::Stats => cmd_stats(&db),
         Commands::Firewall { action } => cmd_firewall(action),
+        Commands::Sandbox {
+            path,
+            timeout,
+            allow_network,
+            god_mode,
+            llm_url,
+        } => cmd_sandbox(&path, timeout, allow_network, god_mode, &llm_url),
+        Commands::Oracle {
+            path,
+            llm_url,
+            model,
+        } => cmd_oracle(&path, &llm_url, &model),
+        Commands::GodScan {
+            path,
+            llm_url,
+            model,
+            json,
+        } => cmd_god_scan(&path, &db, &llm_url, &model, json),
     }
 }
 
@@ -381,6 +443,392 @@ fn cmd_quarantine(action: QuarantineAction) {
                 Err(e) => eprintln!("  Error restoring file: {}", e),
             }
         }
+    }
+}
+
+fn cmd_sandbox(path: &str, timeout: u64, allow_network: bool, god_mode: bool, llm_url: &str) {
+    let path = Path::new(path);
+    if !path.exists() {
+        eprintln!("Error: path '{}' does not exist", path.display());
+        std::process::exit(1);
+    }
+
+    println!("╔══════════════════════════════════════════╗");
+    println!("║  VoidShield — SANDBOX                     ║");
+    println!("║  Malware Detonation Chamber                ║");
+    println!("╚══════════════════════════════════════════╝");
+    println!();
+
+    // Check sandbox availability
+    let backend = match sandbox::check_available() {
+        Some(b) => {
+            println!("  Backend: {:?}", b);
+            b
+        }
+        None => {
+            eprintln!("  ERROR: No sandbox backend available.");
+            eprintln!("  Install bubblewrap: sudo pacman -S bubblewrap");
+            eprintln!("  Or firejail: sudo pacman -S firejail");
+            std::process::exit(1);
+        }
+    };
+
+    let config = sandbox::SandboxConfig {
+        timeout_secs: timeout,
+        allow_network,
+        backend,
+        ..Default::default()
+    };
+
+    if allow_network {
+        println!("  WARNING: Network access ENABLED — malware can phone home!");
+    } else {
+        println!("  Network: BLOCKED (no C2, no exfil)");
+    }
+    println!("  Timeout: {}s", timeout);
+    println!("  File: {}", path.display());
+    println!();
+    println!("  Detonating...");
+    println!();
+
+    match sandbox::detonate(path, &config) {
+        Ok(report) => {
+            // Print sandbox results
+            println!("  ═══════════════════════════════════════");
+            println!("  DETONATION COMPLETE");
+            println!("  ───────────────────────────────────────");
+            println!("  Runtime: {}ms", report.runtime_ms);
+            println!("  Exit code: {:?}", report.exit_code);
+            if report.killed_by_timeout {
+                println!("  KILLED BY TIMEOUT (ran for {}s)", timeout);
+            }
+            println!("  Risk score: {}/100", report.risk_score);
+            println!();
+
+            if !report.behaviors.is_empty() {
+                println!("  OBSERVED BEHAVIORS:");
+                println!("  ─────────────────────────────────────────");
+                for b in &report.behaviors {
+                    let icon = match b.severity {
+                        sandbox::Severity::Critical => "!!",
+                        sandbox::Severity::High => "! ",
+                        sandbox::Severity::Medium => "? ",
+                        sandbox::Severity::Low => "  ",
+                    };
+                    println!("  {} [{}] {} — {}", icon, b.severity, b.category, b.detail);
+                }
+                println!();
+            } else {
+                println!("  No suspicious behaviors observed.");
+                println!();
+            }
+
+            if !report.stdout_excerpt.is_empty() {
+                println!("  STDOUT:");
+                for line in report.stdout_excerpt.lines().take(20) {
+                    println!("    {}", line);
+                }
+                println!();
+            }
+
+            if !report.stderr_excerpt.is_empty() {
+                println!("  STDERR:");
+                for line in report.stderr_excerpt.lines().take(20) {
+                    println!("    {}", line);
+                }
+                println!();
+            }
+
+            println!("  {}", report.summary);
+            println!();
+
+            // If god mode, feed results to Oracle
+            if god_mode {
+                println!("  Consulting God about sandbox results...");
+                println!();
+
+                let oracle_config = oracle::OracleConfig {
+                    base_url: llm_url.to_string(),
+                    timeout_secs: 120,
+                    enabled: true,
+                    ..Default::default()
+                };
+
+                if let Ok(data) = std::fs::read(path) {
+                    let mut heuristic_hits = scanner::heuristic_scan_public(&data, path);
+                    // Add sandbox findings as compact evidence (trim strace noise)
+                    let critical_high: Vec<_> = report.behaviors.iter()
+                        .filter(|b| matches!(b.severity, sandbox::Severity::Critical | sandbox::Severity::High))
+                        .take(6)
+                        .collect();
+                    for b in &critical_high {
+                        let short_detail: String = b.detail.chars().take(80).collect();
+                        heuristic_hits.push(format!("Sandbox:{}:{}", b.category, short_detail));
+                    }
+                    heuristic_hits.push(format!("Sandbox:RiskScore:{}/100", report.risk_score));
+                    heuristic_hits.push(format!("Sandbox:Behaviors:{}total_{}critical_{}high",
+                        report.behaviors.len(),
+                        report.behaviors.iter().filter(|b| matches!(b.severity, sandbox::Severity::Critical)).count(),
+                        report.behaviors.iter().filter(|b| matches!(b.severity, sandbox::Severity::High)).count(),
+                    ));
+                    if report.killed_by_timeout {
+                        heuristic_hits.push("Sandbox:KilledByTimeout".to_string());
+                    }
+
+                    let evidence = oracle::gather_evidence(path, &data, &heuristic_hits);
+                    let response = oracle::consult(&oracle_config, &evidence);
+
+                    match response.verdict {
+                        oracle::Verdict::Smite => {
+                            println!("  ⚡ GOD + SANDBOX VERDICT: SMITE ⚡");
+                            println!("  God has seen this malware's behavior. It dies.");
+                        }
+                        oracle::Verdict::Suspect => {
+                            println!("  ⚠  GOD + SANDBOX VERDICT: SUSPECT");
+                            println!("  God isn't sure. Manual review recommended.");
+                        }
+                        oracle::Verdict::Spare => {
+                            println!("  ✓  GOD + SANDBOX VERDICT: SPARE");
+                            println!("  Sandbox behavior + God analysis: file appears clean.");
+                        }
+                        oracle::Verdict::Unreachable => {
+                            println!("  ?  God unreachable — sandbox results only.");
+                        }
+                    }
+                    println!("  Reasoning: {}", response.reasoning);
+                    println!();
+                }
+            }
+
+            if report.risk_score > 60 {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("  SANDBOX ERROR: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_oracle(path: &str, llm_url: &str, model: &str) {
+    let path = Path::new(path);
+    if !path.exists() {
+        eprintln!("Error: path '{}' does not exist", path.display());
+        std::process::exit(1);
+    }
+
+    println!("╔══════════════════════════════════════════╗");
+    println!("║  VoidShield — GOD MODE                    ║");
+    println!("║  Divine Threat Oracle                      ║");
+    println!("╚══════════════════════════════════════════╝");
+    println!();
+
+    let config = oracle::OracleConfig {
+        base_url: llm_url.to_string(),
+        model: model.to_string(),
+        timeout_secs: 120,
+        enabled: true,
+    };
+
+    // Health check
+    print!("  Connecting to God... ");
+    if !oracle::health_check(&config) {
+        println!("FAILED");
+        eprintln!("  God is unreachable at {}. Is the LLM running?", llm_url);
+        std::process::exit(1);
+    }
+    println!("CONNECTED");
+    println!();
+
+    // Read file
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("  Failed to read file: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Gather evidence
+    let heuristic_hits = scanner::heuristic_scan_public(&data, path);
+    let evidence = oracle::gather_evidence(path, &data, &heuristic_hits);
+
+    println!("  File: {}", evidence.filename);
+    println!("  Size: {} bytes", evidence.size);
+    println!("  Entropy: {:.3}", evidence.entropy);
+    if !evidence.heuristic_flags.is_empty() {
+        println!("  Heuristic flags: {}", evidence.heuristic_flags.join(", "));
+    }
+    if !evidence.suspicious_strings.is_empty() {
+        println!("  Suspicious strings: {}", evidence.suspicious_strings.join(", "));
+    }
+    println!();
+    println!("  Consulting the Oracle...");
+    println!();
+
+    let response = oracle::consult(&config, &evidence);
+
+    match response.verdict {
+        oracle::Verdict::Smite => {
+            println!("  ⚡ DIVINE JUDGEMENT: SMITE ⚡");
+            println!("  ─────────────────────────────────────────");
+            println!("  This malware dreamed of hurting you.");
+            println!("  God says it dies.");
+        }
+        oracle::Verdict::Suspect => {
+            println!("  ⚠  DIVINE JUDGEMENT: SUSPECT");
+            println!("  ─────────────────────────────────────────");
+            println!("  God is not sure about this one.");
+            println!("  Flagged for manual review.");
+        }
+        oracle::Verdict::Spare => {
+            println!("  ✓  DIVINE JUDGEMENT: SPARE");
+            println!("  ─────────────────────────────────────────");
+            println!("  This file may live. God shows mercy.");
+        }
+        oracle::Verdict::Unreachable => {
+            println!("  ?  DIVINE JUDGEMENT: UNREACHABLE");
+            println!("  ─────────────────────────────────────────");
+            println!("  God could not be reached.");
+        }
+    }
+    println!();
+    println!("  Reasoning: {}", response.reasoning);
+    println!("  Confidence: {:.0}%", response.confidence * 100.0);
+    println!("  Response time: {}ms", response.response_time_ms);
+    println!();
+
+    if response.verdict == oracle::Verdict::Smite {
+        println!("  Run 'voidshield scan {}' to quarantine.", path.display());
+        std::process::exit(1);
+    }
+}
+
+fn cmd_god_scan(path: &str, db: &signatures::SigDB, llm_url: &str, model: &str, json: bool) {
+    let path = Path::new(path);
+    if !path.exists() {
+        eprintln!("Error: path '{}' does not exist", path.display());
+        std::process::exit(1);
+    }
+
+    let config = oracle::OracleConfig {
+        base_url: llm_url.to_string(),
+        model: model.to_string(),
+        timeout_secs: 120,
+        enabled: true,
+    };
+
+    if !json {
+        println!("╔══════════════════════════════════════════╗");
+        println!("║  VoidShield — GOD SCAN                    ║");
+        println!("║  Full scan + Divine Oracle judgement        ║");
+        println!("╚══════════════════════════════════════════╝");
+        println!();
+
+        print!("  Connecting to God... ");
+        if !oracle::health_check(&config) {
+            println!("FAILED — falling back to mortal scan");
+            cmd_scan(&path.display().to_string(), db, json);
+            return;
+        }
+        println!("CONNECTED");
+        println!();
+    }
+
+    let start = Instant::now();
+    let results = if path.is_file() {
+        vec![scanner::scan_file(path, db)]
+    } else {
+        scanner::scan_directory(path, db, Some(&|done, total, _file| {
+            if done % 100 == 0 || done == total {
+                eprint!("\r  Scanning: {}/{} files... ", done, total);
+            }
+        }))
+    };
+    eprintln!();
+
+    // Now consult the Oracle on anything that triggered heuristics or was infected
+    let mut god_verdicts: Vec<(String, oracle::OracleResponse)> = Vec::new();
+    let suspicious: Vec<_> = results
+        .iter()
+        .filter(|r| matches!(r.status, scanner::ScanStatus::Infected))
+        .collect();
+
+    if !suspicious.is_empty() && !json {
+        println!("  {} suspicious files found. Consulting God...", suspicious.len());
+        println!();
+    }
+
+    for result in &suspicious {
+        let file_path = Path::new(&result.path);
+        if let Ok(data) = std::fs::read(file_path) {
+            let evidence = oracle::gather_evidence(file_path, &data, &result.threats);
+            let response = oracle::consult(&config, &evidence);
+            god_verdicts.push((result.path.clone(), response));
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let total = results.len();
+    let clean = results
+        .iter()
+        .filter(|r| matches!(r.status, scanner::ScanStatus::Clean))
+        .count();
+    let infected_count = suspicious.len();
+
+    if json {
+        let output = serde_json::json!({
+            "scan_results": results,
+            "oracle_verdicts": god_verdicts.iter().map(|(path, resp)| {
+                serde_json::json!({
+                    "path": path,
+                    "verdict": resp.verdict.to_string(),
+                    "reasoning": resp.reasoning,
+                    "confidence": resp.confidence,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        return;
+    }
+
+    // Print divine judgements
+    if !god_verdicts.is_empty() {
+        println!("⚡ DIVINE JUDGEMENTS:");
+        println!("─────────────────────────────────────────────");
+        for (path, resp) in &god_verdicts {
+            let icon = match resp.verdict {
+                oracle::Verdict::Smite => "⚡ SMITE",
+                oracle::Verdict::Suspect => "⚠  SUSPECT",
+                oracle::Verdict::Spare => "✓  SPARE",
+                oracle::Verdict::Unreachable => "?  UNREACHABLE",
+            };
+            println!("  {} — {}", icon, path);
+            println!("     └─ {} (confidence: {:.0}%)", resp.reasoning.lines().next().unwrap_or(""), resp.confidence * 100.0);
+        }
+        println!();
+    }
+
+    // Print threats that God says SMITE
+    let smites: Vec<_> = god_verdicts
+        .iter()
+        .filter(|(_, r)| r.verdict == oracle::Verdict::Smite)
+        .collect();
+
+    println!("═══════════════════════════════════════════");
+    println!("  God Scan Complete");
+    println!("───────────────────────────────────────────");
+    println!("  Files scanned:   {}", total);
+    println!("  Clean:           {}", clean);
+    println!("  Flagged:         {}", infected_count);
+    println!("  God says SMITE:  {}", smites.len());
+    println!("  God says SPARE:  {}", god_verdicts.iter().filter(|(_, r)| r.verdict == oracle::Verdict::Spare).count());
+    println!("  Time:            {:.2}s", elapsed.as_secs_f64());
+    println!("═══════════════════════════════════════════");
+
+    if !smites.is_empty() {
+        std::process::exit(1);
     }
 }
 

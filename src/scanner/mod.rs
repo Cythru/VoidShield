@@ -178,6 +178,11 @@ pub fn scan_directory(
     results
 }
 
+/// Public wrapper for oracle access to heuristics.
+pub fn heuristic_scan_public(data: &[u8], path: &Path) -> Vec<String> {
+    heuristic_scan(data, path)
+}
+
 /// Basic heuristic checks on file content.
 fn heuristic_scan(data: &[u8], path: &Path) -> Vec<String> {
     let mut hits = Vec::new();
