@@ -22,7 +22,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-const SIG_DIR: &str = "/var/lib/voidshield/signatures";
+// Platform-aware signature directory
+// Linux system install: /var/lib/voidshield/signatures
+// macOS / Android / Windows: ~/.voidshield/signatures
+fn default_sig_dir() -> std::path::PathBuf {
+    if cfg!(target_os = "linux") && !cfg!(target_os = "android") {
+        // Check if system dir exists (proper install), else fall back to home
+        let sys = std::path::Path::new("/var/lib/voidshield/signatures");
+        if sys.exists() {
+            return sys.to_path_buf();
+        }
+    }
+    dirs_next::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".voidshield")
+        .join("signatures")
+}
 const DEFAULT_SIG_DIR: &str = "signatures-db";
 
 #[derive(Parser)]
@@ -170,10 +185,9 @@ fn main() {
 
     // Load signature database
     let mut db = signatures::SigDB::new();
-    let sig_dir = if Path::new(SIG_DIR).exists() {
-        PathBuf::from(SIG_DIR)
-    } else {
-        PathBuf::from(DEFAULT_SIG_DIR)
+    let sig_dir = {
+        let d = default_sig_dir();
+        if d.exists() { d } else { PathBuf::from(DEFAULT_SIG_DIR) }
     };
 
     let start = Instant::now();
@@ -316,12 +330,14 @@ fn cmd_scan(path: &str, db: &signatures::SigDB, json: bool) {
 
 fn cmd_quick_scan(db: &signatures::SigDB, json: bool) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
-    let quick_paths = vec![
+    let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+    let mut quick_paths = vec![
         format!("{}/Downloads", home),
-        "/tmp".into(),
-        "/var/tmp".into(),
+        tmp,
         format!("{}/.local/bin", home),
     ];
+    // Linux only: /var/tmp
+    if cfg!(target_os = "linux") { quick_paths.push("/var/tmp".into()); }
 
     println!("╔══════════════════════════════════════════╗");
     println!("║     VoidShield — Quick Scan              ║");
@@ -338,7 +354,10 @@ fn cmd_quick_scan(db: &signatures::SigDB, json: bool) {
 fn cmd_realtime(db: signatures::SigDB, watch: Option<Vec<String>>) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
     let watch_paths = watch.unwrap_or_else(|| {
-        vec![home, "/tmp".into(), "/var/tmp".into()]
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        let mut v = vec![home, tmp];
+        if cfg!(target_os = "linux") { v.push("/var/tmp".into()); }
+        v
     });
 
     println!("╔══════════════════════════════════════════╗");
@@ -373,10 +392,10 @@ fn cmd_update() {
     println!("╚══════════════════════════════════════════╝");
     println!();
 
-    let sig_dir = if Path::new(SIG_DIR).exists() || std::fs::create_dir_all(SIG_DIR).is_ok() {
-        PathBuf::from(SIG_DIR)
-    } else {
-        PathBuf::from(DEFAULT_SIG_DIR)
+    let sig_dir = {
+        let d = default_sig_dir();
+        std::fs::create_dir_all(&d).ok();
+        if d.exists() { d } else { PathBuf::from(DEFAULT_SIG_DIR) }
     };
     std::fs::create_dir_all(&sig_dir).ok();
 

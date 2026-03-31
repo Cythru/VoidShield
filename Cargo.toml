@@ -21,6 +21,7 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }  # HTTP for sig 
 notify = "7"                # Filesystem watcher (real-time)
 log = "0.4"
 env_logger = "0.11"
+dirs-next = "2"             # Cross-platform home/data dirs (Linux/macOS/Windows/Android)
 
 [profile.release]
 opt-level = 3

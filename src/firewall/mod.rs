@@ -13,8 +13,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
-const CONFIG_DIR: &str = "/var/lib/voidshield";
+// System config dir (Linux system install); user fallback used on macOS/Android/Windows
+const SYSTEM_CONFIG_DIR: &str = "/var/lib/voidshield";
 const USER_CONFIG_DIR: &str = ".local/share/voidshield";
+
+fn config_dir() -> PathBuf {
+    let sys = Path::new(SYSTEM_CONFIG_DIR);
+    if sys.exists() || cfg!(target_os = "linux") && !cfg!(target_os = "android") {
+        return sys.to_path_buf();
+    }
+    // macOS / Android / Windows: use ~/.local/share/voidshield
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(USER_CONFIG_DIR))
+        .unwrap_or_else(|_| PathBuf::from("voidshield-data"))
+}
 const CHAIN_NAME: &str = "VOIDSHIELD";
 
 // ── Rule types ───────────────────────────────────────────────────────────────

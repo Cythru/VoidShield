@@ -1,0 +1,63 @@
+# Cross-platform build config
+# Pixel 10 Pro (Tensor G5 / Cortex-X4): native build on device
+# Desktop x86_64: build with x86-64-v3 (AVX2) for modern CPUs
+# macOS ARM64: uses apple-m series auto-detection via rustup target
+
+[build]
+# Use all available cores
+jobs = 0
+
+# ── Android / Termux (aarch64-linux-android) ─────────────────────────────────
+# When building natively on Termux the host IS the target — these flags
+# activate Tensor G5 (Cortex-X4) SVE2, dotprod, fp16fml for maximum speed.
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "target-cpu=cortex-x4",
+    "-C", "target-feature=+sve2,+dotprod,+fp16fml,+i8mm,+bf16",
+    "-C", "opt-level=3",
+    "-C", "codegen-units=1",
+]
+
+# ── Generic aarch64 Linux (phones, Raspberry Pi 5, AWS Graviton) ─────────────
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+neon,+fp16,+dotprod",
+    "-C", "opt-level=3",
+]
+
+# ── macOS Apple Silicon ───────────────────────────────────────────────────────
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=apple-m1",
+    "-C", "target-feature=+neon,+fp16,+dotprod",
+    "-C", "opt-level=3",
+]
+
+# ── Desktop Linux x86_64 ──────────────────────────────────────────────────────
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=x86-64-v3",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+popcnt",
+    "-C", "opt-level=3",
+]
+
+# ── macOS Intel ───────────────────────────────────────────────────────────────
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "opt-level=3",
+]
+
+# ── Windows x86_64 ───────────────────────────────────────────────────────────
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-cpu=x86-64-v3",
+    "-C", "target-feature=+avx2,+fma",
+]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+    "-C", "target-cpu=x86-64-v3",
+    "-C", "target-feature=+avx2,+fma",
+]
