@@ -4,8 +4,8 @@
 # macOS ARM64: uses apple-m series auto-detection via rustup target
 
 [build]
-# Use all available cores
-jobs = 0
+# 6 of 8 cores — leaves headroom to avoid OOM on Android
+jobs = 6
 
 # ── Android / Termux (aarch64-linux-android) ─────────────────────────────────
 # When building natively on Termux the host IS the target — these flags

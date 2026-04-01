@@ -1,0 +1,272 @@
+//! File scanner — scans files against the signature database.
+//!
+//! Supports hash-based and pattern-based detection.
+//! Uses memory-mapped I/O for large files and rayon for parallelism.
+
+use crate::signatures::SigDB;
+use memmap2::Mmap;
+use rayon::prelude::*;
+use md5::Md5;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use walkdir::WalkDir;
+
+/// Result of scanning a single file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanResult {
+    pub path: String,
+    pub status: ScanStatus,
+    pub threats: Vec<String>,
+    pub size: u64,
+    pub scan_time_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum ScanStatus {
+    Clean,
+    Infected,
+    Error(String),
+    Skipped,
+}
+
+/// Scan a single file against the signature database.
+pub fn scan_file(path: &Path, db: &SigDB) -> ScanResult {
+    let start = Instant::now();
+    let path_str = path.display().to_string();
+
+    // Skip non-regular files
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            return ScanResult {
+                path: path_str,
+                status: ScanStatus::Error(e.to_string()),
+                threats: vec![],
+                size: 0,
+                scan_time_ms: start.elapsed().as_millis() as u64,
+            }
+        }
+    };
+
+    if !meta.is_file() {
+        return ScanResult {
+            path: path_str,
+            status: ScanStatus::Skipped,
+            threats: vec![],
+            size: 0,
+            scan_time_ms: 0,
+        };
+    }
+
+    let size = meta.len();
+
+    // Skip very large files (>500MB) and empty files
+    if size == 0 || size > 500 * 1024 * 1024 {
+        return ScanResult {
+            path: path_str,
+            status: ScanStatus::Skipped,
+            threats: vec![],
+            size,
+            scan_time_ms: 0,
+        };
+    }
+
+    let mut threats = Vec::new();
+
+    // Read file content
+    let data = if size > 10 * 1024 * 1024 {
+        // Memory-map large files
+        match fs::File::open(path).and_then(|f| unsafe { Mmap::map(&f) }) {
+            Ok(mmap) => mmap.to_vec(),
+            Err(e) => {
+                return ScanResult {
+                    path: path_str,
+                    status: ScanStatus::Error(e.to_string()),
+                    threats: vec![],
+                    size,
+                    scan_time_ms: start.elapsed().as_millis() as u64,
+                }
+            }
+        }
+    } else {
+        match fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                return ScanResult {
+                    path: path_str,
+                    status: ScanStatus::Error(e.to_string()),
+                    threats: vec![],
+                    size,
+                    scan_time_ms: start.elapsed().as_millis() as u64,
+                }
+            }
+        }
+    };
+
+    // 1. Hash-based detection (SHA-256)
+    let sha256 = hex::encode(Sha256::digest(&data));
+    if let Some(name) = db.check_hash_sha256(&sha256) {
+        threats.push(format!("SHA256:{}", name));
+    }
+
+    // 2. MD5 hash detection
+    let md5 = md5_hash(&data);
+    if let Some(name) = db.check_hash_md5(&md5) {
+        threats.push(format!("MD5:{}", name));
+    }
+
+    // 3. Pattern-based detection (Aho-Corasick)
+    let pattern_hits = db.scan_content(&data);
+    for hit in pattern_hits {
+        threats.push(format!("Pattern:{}", hit));
+    }
+
+    // 4. Heuristic checks
+    let heuristic_hits = heuristic_scan(&data, path);
+    threats.extend(heuristic_hits);
+
+    let status = if threats.is_empty() {
+        ScanStatus::Clean
+    } else {
+        ScanStatus::Infected
+    };
+
+    ScanResult {
+        path: path_str,
+        status,
+        threats,
+        size,
+        scan_time_ms: start.elapsed().as_millis() as u64,
+    }
+}
+
+/// Scan a directory recursively using parallel workers.
+pub fn scan_directory(
+    dir: &Path,
+    db: &SigDB,
+    progress_cb: Option<&(dyn Fn(usize, usize, &str) + Sync)>,
+) -> Vec<ScanResult> {
+    // Collect all file paths first
+    let files: Vec<PathBuf> = WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    let total = files.len();
+    let scanned = Arc::new(Mutex::new(0usize));
+
+    let results: Vec<ScanResult> = files
+        .par_iter()
+        .map(|path| {
+            let result = scan_file(path, db);
+            if let Some(cb) = progress_cb {
+                let mut count = scanned.lock().unwrap();
+                *count += 1;
+                cb(*count, total, &result.path);
+            }
+            result
+        })
+        .collect();
+
+    results
+}
+
+/// Public wrapper for oracle access to heuristics.
+pub fn heuristic_scan_public(data: &[u8], path: &Path) -> Vec<String> {
+    heuristic_scan(data, path)
+}
+
+/// Basic heuristic checks on file content.
+fn heuristic_scan(data: &[u8], path: &Path) -> Vec<String> {
+    let mut hits = Vec::new();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Check for suspicious PE characteristics
+    if data.len() > 2 && data[0] == b'M' && data[1] == b'Z' {
+        // It's a PE file
+        let entropy = calculate_entropy(data);
+        if entropy > 7.5 {
+            hits.push("Heuristic:HighEntropy.Packed".to_string());
+        }
+
+        // Check for suspicious strings
+        let content = String::from_utf8_lossy(data);
+        let suspicious_imports = [
+            "VirtualAlloc", "WriteProcessMemory", "CreateRemoteThread",
+            "NtUnmapViewOfSection", "RtlCreateUserThread",
+            "LoadLibraryA", "GetProcAddress",
+        ];
+        let mut sus_count = 0;
+        for imp in &suspicious_imports {
+            if content.contains(imp) {
+                sus_count += 1;
+            }
+        }
+        if sus_count >= 4 {
+            hits.push("Heuristic:SuspiciousImports.ProcessInjection".to_string());
+        }
+    }
+
+    // ELF heuristics
+    if data.len() > 4 && &data[0..4] == b"\x7fELF" {
+        let entropy = calculate_entropy(data);
+        if entropy > 7.5 {
+            hits.push("Heuristic:HighEntropy.PackedELF".to_string());
+        }
+    }
+
+    // Script-based threats
+    if matches!(ext.as_str(), "sh" | "py" | "pl" | "rb" | "ps1" | "bat" | "cmd" | "vbs") {
+        let content = String::from_utf8_lossy(data);
+        if content.contains("rm -rf /") || content.contains(":(){ :|:& };:") {
+            hits.push("Heuristic:Destructive.ShellCommand".to_string());
+        }
+        if content.contains("base64") && (content.contains("eval") || content.contains("exec")) {
+            hits.push("Heuristic:ObfuscatedScript.Base64Eval".to_string());
+        }
+        // Reverse shell patterns
+        if (content.contains("/dev/tcp/") || content.contains("socket"))
+            && (content.contains("/bin/sh") || content.contains("/bin/bash"))
+        {
+            hits.push("Heuristic:ReverseShell".to_string());
+        }
+    }
+
+    hits
+}
+
+/// Calculate Shannon entropy of data (0.0 = uniform, 8.0 = random/encrypted).
+fn calculate_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut freq = [0u64; 256];
+    for &byte in data {
+        freq[byte as usize] += 1;
+    }
+    let len = data.len() as f64;
+    let mut entropy = 0.0;
+    for &count in &freq {
+        if count > 0 {
+            let p = count as f64 / len;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
+}
+
+/// MD5 hash for ClamAV signature compatibility.
+fn md5_hash(data: &[u8]) -> String {
+    hex::encode(Md5::digest(data))
+}
