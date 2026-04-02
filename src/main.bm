@@ -9,12 +9,16 @@
 //!   voidshield quarantine restore  Restore a quarantined file
 
 mod firewall;
+mod notifier;
 mod oracle;
 mod quarantine;
 mod realtime;
 mod sandbox;
 mod scanner;
 mod signatures;
+mod threat_mode;
+
+use threat_mode::ThreatMode;
 
 use clap::{Parser, Subcommand};
 use log::{error, info};
@@ -44,6 +48,9 @@ const DEFAULT_SIG_DIR: &str = "signatures-db";
 #[command(name = "voidshield")]
 #[command(about = "VoidShield — Next-Gen Antivirus Engine", long_about = None)]
 struct Cli {
+    /// Threat detection mode: moderate | aggressive | paranoid (default: aggressive)
+    #[arg(long, global = true, default_value = "aggressive")]
+    mode: ThreatMode,
     #[command(subcommand)]
     command: Commands,
 }
@@ -68,6 +75,9 @@ enum Commands {
         /// Paths to monitor (default: /home, /tmp, /var/tmp)
         #[arg(long, num_args = 1..)]
         watch: Option<Vec<String>>,
+        /// Override global mode for realtime only
+        #[arg(long)]
+        mode: Option<ThreatMode>,
     },
     /// Update signature databases
     Update,
@@ -208,7 +218,7 @@ fn main() {
     match cli.command {
         Commands::Scan { path, json } => cmd_scan(&path, &db, json),
         Commands::QuickScan { json } => cmd_quick_scan(&db, json),
-        Commands::Realtime { watch } => cmd_realtime(db, watch),
+        Commands::Realtime { watch, mode: rt_mode } => cmd_realtime(db, watch, rt_mode.unwrap_or(cli.mode)),
         Commands::Update => cmd_update(),
         Commands::Quarantine { action } => cmd_quarantine(action),
         Commands::Stats => cmd_stats(&db),
@@ -351,7 +361,7 @@ fn cmd_quick_scan(db: &signatures::SigDB, json: bool) {
     }
 }
 
-fn cmd_realtime(db: signatures::SigDB, watch: Option<Vec<String>>) {
+fn cmd_realtime(db: signatures::SigDB, watch: Option<Vec<String>>, mode: ThreatMode) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
     let watch_paths = watch.unwrap_or_else(|| {
         let tmp = std::env::temp_dir().to_string_lossy().into_owned();
@@ -364,16 +374,17 @@ fn cmd_realtime(db: signatures::SigDB, watch: Option<Vec<String>>) {
     println!("║  VoidShield — Real-Time Protection       ║");
     println!("╚══════════════════════════════════════════╝");
     println!();
+    println!("  Mode:  {}", mode);
     println!("  Monitoring:");
     for p in &watch_paths {
-        println!("    📁 {}", p);
+        println!("    {} {}", if mode == ThreatMode::Paranoid { "🔴" } else { "📁" }, p);
     }
     println!();
     println!("  Press Ctrl+C to stop.");
     println!();
 
     let db = Arc::new(db);
-    match realtime::start_realtime_monitor(db, watch_paths) {
+    match realtime::start_realtime_monitor(db, watch_paths, mode) {
         Ok(_watcher) => {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));

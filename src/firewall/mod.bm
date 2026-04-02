@@ -178,8 +178,8 @@ impl ConnectionTracker {
 // ── Config I/O ───────────────────────────────────────────────────────────────
 
 fn config_path() -> PathBuf {
-    if Path::new(CONFIG_DIR).exists() {
-        PathBuf::from(CONFIG_DIR).join("firewall.json")
+    if Path::new(SYSTEM_CONFIG_DIR).exists() {
+        PathBuf::from(SYSTEM_CONFIG_DIR).join("firewall.json")
     } else {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         let dir = PathBuf::from(&home).join(USER_CONFIG_DIR);

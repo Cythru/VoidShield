@@ -1,0 +1,57 @@
+// notify.rs — Android notification bridge via termux-notification
+// Silent on moderate (no popup for clean ops), loud on aggressive/paranoid
+
+use crate::threat_mode::ThreatMode;
+
+const TERMUX_NOTIFY: &str = "/data/data/com.termux/files/usr/bin/termux-notification";
+
+pub fn alert(mode: ThreatMode, title: &str, body: &str) {
+    // Moderate: only confirmed threats get notified — caller controls this
+    // Aggressive/Paranoid: always notify
+    let priority = match mode {
+        ThreatMode::Paranoid   => "max",
+        ThreatMode::Aggressive => "high",
+        ThreatMode::Moderate   => "default",
+    };
+
+    let _ = std::process::Command::new(TERMUX_NOTIFY)
+        .args([
+            "--title",    title,
+            "--content",  body,
+            "--priority", priority,
+            "--id",       "666",
+            "--ongoing",
+        ])
+        .spawn();
+
+    // Also vibrate on aggressive/paranoid
+    if matches!(mode, ThreatMode::Aggressive | ThreatMode::Paranoid) {
+        let _ = std::process::Command::new(
+            "/data/data/com.termux/files/usr/bin/termux-vibrate"
+        )
+        .args(["-d", "500"])
+        .spawn();
+    }
+}
+
+/// Paranoid mode: prompt via termux-dialog, returns true = user said block
+pub fn prompt_block(path: &str) -> bool {
+    let output = std::process::Command::new(
+        "/data/data/com.termux/files/usr/bin/termux-dialog"
+    )
+    .args([
+        "confirm",
+        "-t", "VoidShield — Unknown File",
+        "-i", &format!("Block and quarantine?\n{}", path),
+    ])
+    .output();
+
+    match output {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            // termux-dialog confirm returns {"code":0,"text":"","index":0} on yes
+            text.contains("\"code\":0") || text.contains("\"index\":0")
+        }
+        Err(_) => true, // if dialog unavailable, default to block in paranoid mode
+    }
+}

@@ -1,72 +1,37 @@
-//! Real-time file protection using Linux fanotify/inotify.
-//!
-//! Watches the filesystem for file opens/modifications and scans them
-//! before allowing access. Quarantines infected files automatically.
+//! Real-time file protection using inotify/fanotify.
+//! Mode-aware: Moderate = confirmed only | Aggressive = heuristics too | Paranoid = default-deny + prompt
 
+use crate::notifier;
 use crate::quarantine::QuarantineManifest;
 use crate::scanner;
 use crate::signatures::SigDB;
+use crate::threat_mode::ThreatMode;
 use log::{error, info, warn};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-/// Start real-time filesystem monitoring with auto-quarantine.
 pub fn start_realtime_monitor(
     db: Arc<SigDB>,
     watch_paths: Vec<String>,
+    mode: ThreatMode,
 ) -> notify::Result<notify::RecommendedWatcher> {
-    let db_clone = db.clone();
     let manifest = Arc::new(Mutex::new(QuarantineManifest::load()));
+    info!("Realtime protection active — mode: {}", mode);
 
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         match res {
-            Ok(event) => {
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) => {
-                        for path in &event.paths {
-                            if path.is_file() {
-                                let result = scanner::scan_file(path, &db_clone);
-                                match result.status {
-                                    scanner::ScanStatus::Infected => {
-                                        warn!(
-                                            "THREAT DETECTED: {} — {:?}",
-                                            result.path, result.threats
-                                        );
-                                        // Compute SHA256 for quarantine
-                                        if let Ok(data) = std::fs::read(path) {
-                                            let sha256 = hex::encode(Sha256::digest(&data));
-                                            let mut m = manifest.lock().unwrap();
-                                            match m.quarantine_file(
-                                                path,
-                                                result.threats.clone(),
-                                                &sha256,
-                                            ) {
-                                                Ok(()) => {
-                                                    warn!("QUARANTINED: {}", result.path);
-                                                }
-                                                Err(e) => {
-                                                    error!(
-                                                        "Failed to quarantine {}: {}",
-                                                        result.path, e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    scanner::ScanStatus::Clean => {}
-                                    scanner::ScanStatus::Error(ref e) => {
-                                        error!("Scan error on {}: {}", result.path, e);
-                                    }
-                                    scanner::ScanStatus::Skipped => {}
-                                }
-                            }
+            Ok(event) => match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) => {
+                    for path in &event.paths {
+                        if path.is_file() {
+                            handle_file(path, &db, &manifest, mode);
                         }
                     }
-                    _ => {}
                 }
-            }
+                _ => {}
+            },
             Err(e) => error!("Watch error: {:?}", e),
         }
     })?;
@@ -77,4 +42,62 @@ pub fn start_realtime_monitor(
     }
 
     Ok(watcher)
+}
+
+fn handle_file(
+    path: &Path,
+    db: &Arc<SigDB>,
+    manifest: &Arc<Mutex<QuarantineManifest>>,
+    mode: ThreatMode,
+) {
+    let result = scanner::scan_file_mode(path, db, mode);
+
+    match result.status {
+        scanner::ScanStatus::Infected => {
+            let threat_list = result.threats.join(", ");
+            warn!("THREAT DETECTED: {} — {}", result.path, threat_list);
+
+            notifier::alert(
+                mode,
+                "VoidShield — THREAT DETECTED",
+                &format!("{}\n{}", shorten(&result.path), threat_list),
+            );
+
+            let should_quarantine = if mode.prompt_on_unknown() {
+                notifier::prompt_block(&result.path)
+            } else {
+                true // aggressive + moderate: auto-quarantine, no prompt
+            };
+
+            if should_quarantine {
+                if let Ok(data) = std::fs::read(path) {
+                    let sha256 = hex::encode(Sha256::digest(&data));
+                    let mut m = manifest.lock().unwrap();
+                    match m.quarantine_file(path, result.threats.clone(), &sha256) {
+                        Ok(()) => warn!("QUARANTINED: {}", result.path),
+                        Err(e) => error!("Quarantine failed {}: {}", result.path, e),
+                    }
+                }
+            }
+        }
+        scanner::ScanStatus::Clean => {
+            // Paranoid: log new executables even if clean
+            if mode == ThreatMode::Paranoid {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if matches!(ext, "sh" | "py" | "elf" | "bin" | "so" | "apk") {
+                    notifier::alert(
+                        mode,
+                        "VoidShield — New Executable",
+                        &format!("Clean scan: {}", shorten(&result.path)),
+                    );
+                }
+            }
+        }
+        scanner::ScanStatus::Error(ref e) => error!("Scan error on {}: {}", result.path, e),
+        scanner::ScanStatus::Skipped => {}
+    }
+}
+
+fn shorten(path: &str) -> &str {
+    path.rfind('/').map(|i| &path[i + 1..]).unwrap_or(path)
 }

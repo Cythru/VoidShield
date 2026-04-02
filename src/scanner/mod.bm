@@ -4,6 +4,7 @@
 //! Uses memory-mapped I/O for large files and rayon for parallelism.
 
 use crate::signatures::SigDB;
+use crate::threat_mode::ThreatMode;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use md5::Md5;
@@ -35,6 +36,10 @@ pub enum ScanStatus {
 
 /// Scan a single file against the signature database.
 pub fn scan_file(path: &Path, db: &SigDB) -> ScanResult {
+    scan_file_mode(path, db, ThreatMode::default())
+}
+
+pub fn scan_file_mode(path: &Path, db: &SigDB, mode: ThreatMode) -> ScanResult {
     let start = Instant::now();
     let path_str = path.display().to_string();
 
@@ -126,7 +131,7 @@ pub fn scan_file(path: &Path, db: &SigDB) -> ScanResult {
     }
 
     // 4. Heuristic checks
-    let heuristic_hits = heuristic_scan(&data, path);
+    let heuristic_hits = heuristic_scan(&data, path, mode);
     threats.extend(heuristic_hits);
 
     let status = if threats.is_empty() {
@@ -180,11 +185,11 @@ pub fn scan_directory(
 
 /// Public wrapper for oracle access to heuristics.
 pub fn heuristic_scan_public(data: &[u8], path: &Path) -> Vec<String> {
-    heuristic_scan(data, path)
+    heuristic_scan(data, path, ThreatMode::default())
 }
 
-/// Basic heuristic checks on file content.
-fn heuristic_scan(data: &[u8], path: &Path) -> Vec<String> {
+/// Heuristic checks — thresholds scale with ThreatMode.
+fn heuristic_scan(data: &[u8], path: &Path, mode: ThreatMode) -> Vec<String> {
     let mut hits = Vec::new();
     let ext = path
         .extension()
@@ -192,54 +197,85 @@ fn heuristic_scan(data: &[u8], path: &Path) -> Vec<String> {
         .unwrap_or("")
         .to_lowercase();
 
-    // Check for suspicious PE characteristics
+    let entropy_thresh  = mode.entropy_threshold();
+    let import_thresh   = mode.sus_import_threshold();
+
+    // ── PE (Windows) ─────────────────────────────────────────────────────────
     if data.len() > 2 && data[0] == b'M' && data[1] == b'Z' {
-        // It's a PE file
         let entropy = calculate_entropy(data);
-        if entropy > 7.5 {
+        if entropy > entropy_thresh {
             hits.push("Heuristic:HighEntropy.Packed".to_string());
         }
-
-        // Check for suspicious strings
         let content = String::from_utf8_lossy(data);
-        let suspicious_imports = [
+        // Process injection indicators
+        let injection_imports = [
             "VirtualAlloc", "WriteProcessMemory", "CreateRemoteThread",
             "NtUnmapViewOfSection", "RtlCreateUserThread",
             "LoadLibraryA", "GetProcAddress",
         ];
-        let mut sus_count = 0;
-        for imp in &suspicious_imports {
-            if content.contains(imp) {
-                sus_count += 1;
-            }
-        }
-        if sus_count >= 4 {
+        let sus_count = injection_imports.iter().filter(|i| content.contains(*i)).count();
+        if sus_count >= import_thresh {
             hits.push("Heuristic:SuspiciousImports.ProcessInjection".to_string());
         }
-    }
-
-    // ELF heuristics
-    if data.len() > 4 && &data[0..4] == b"\x7fELF" {
-        let entropy = calculate_entropy(data);
-        if entropy > 7.5 {
-            hits.push("Heuristic:HighEntropy.PackedELF".to_string());
+        // Aggressive/Paranoid: credential theft patterns
+        if mode.flag_heuristics() {
+            if content.contains("lsass") || content.contains("SAMKey") || content.contains("NtlmHash") {
+                hits.push("Heuristic:CredentialTheft".to_string());
+            }
+            if content.contains("IsDebuggerPresent") || content.contains("CheckRemoteDebuggerPresent") {
+                hits.push("Heuristic:AntiDebug".to_string());
+            }
         }
     }
 
-    // Script-based threats
-    if matches!(ext.as_str(), "sh" | "py" | "pl" | "rb" | "ps1" | "bat" | "cmd" | "vbs") {
+    // ── ELF (Linux/Android) ───────────────────────────────────────────────────
+    if data.len() > 4 && &data[0..4] == b"\x7fELF" {
+        let entropy = calculate_entropy(data);
+        if entropy > entropy_thresh {
+            hits.push("Heuristic:HighEntropy.PackedELF".to_string());
+        }
+        if mode.flag_heuristics() {
+            let content = String::from_utf8_lossy(data);
+            if content.contains("ptrace") && content.contains("/proc/self") {
+                hits.push("Heuristic:AntiDebug.ELF".to_string());
+            }
+            if content.contains("/system/bin/su") || content.contains("com.noshufou.android.su") {
+                hits.push("Heuristic:RootExploit.Android".to_string());
+            }
+        }
+    }
+
+    // ── Scripts ───────────────────────────────────────────────────────────────
+    if matches!(ext.as_str(), "sh" | "py" | "pl" | "rb" | "ps1" | "bat" | "cmd" | "vbs" | "js") {
         let content = String::from_utf8_lossy(data);
+        // Always — confirmed destructive
         if content.contains("rm -rf /") || content.contains(":(){ :|:& };:") {
             hits.push("Heuristic:Destructive.ShellCommand".to_string());
         }
         if content.contains("base64") && (content.contains("eval") || content.contains("exec")) {
             hits.push("Heuristic:ObfuscatedScript.Base64Eval".to_string());
         }
-        // Reverse shell patterns
         if (content.contains("/dev/tcp/") || content.contains("socket"))
             && (content.contains("/bin/sh") || content.contains("/bin/bash"))
         {
             hits.push("Heuristic:ReverseShell".to_string());
+        }
+        // Aggressive/Paranoid — wider net
+        if mode.flag_heuristics() {
+            if content.contains("wget") || content.contains("curl") {
+                if content.contains("| bash") || content.contains("|bash") || content.contains("| sh") {
+                    hits.push("Heuristic:DriveByDownload".to_string());
+                }
+            }
+            if content.contains("chmod +x") && content.contains("/tmp/") {
+                hits.push("Heuristic:TempExec".to_string());
+            }
+            if content.contains("crontab") && content.contains("@reboot") {
+                hits.push("Heuristic:PersistenceCron".to_string());
+            }
+            if content.contains("nohup") && content.contains("&") && content.contains("/tmp/") {
+                hits.push("Heuristic:BackgroundDaemon.Tmp".to_string());
+            }
         }
     }
 

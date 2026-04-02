@@ -1,0 +1,69 @@
+// threat_mode.rs — scan posture config
+// Moderate:   confirmed threats only, silent auto-quarantine, no prompts
+// Aggressive: heuristic hits too, notify, auto-quarantine, no prompts
+// Paranoid:   default-deny, quarantine unknowns, notify + prompt via termux-dialog
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum ThreatMode {
+    Moderate,
+    #[default]
+    Aggressive,
+    Paranoid,
+}
+
+impl ThreatMode {
+    /// Entropy threshold — above this = suspicious packed binary
+    pub fn entropy_threshold(&self) -> f64 {
+        match self {
+            ThreatMode::Moderate   => 7.5,
+            ThreatMode::Aggressive => 6.5,
+            ThreatMode::Paranoid   => 6.0,
+        }
+    }
+
+    /// Suspicious import count before flagging process injection
+    pub fn sus_import_threshold(&self) -> usize {
+        match self {
+            ThreatMode::Moderate   => 4,
+            ThreatMode::Aggressive => 2,
+            ThreatMode::Paranoid   => 1,
+        }
+    }
+
+    /// Whether to flag heuristic-only hits (no sig match required)
+    pub fn flag_heuristics(&self) -> bool {
+        matches!(self, ThreatMode::Aggressive | ThreatMode::Paranoid)
+    }
+
+    /// Whether to quarantine on heuristic hit alone
+    pub fn quarantine_on_heuristic(&self) -> bool {
+        matches!(self, ThreatMode::Aggressive | ThreatMode::Paranoid)
+    }
+
+    /// Whether to prompt before acting (paranoid only)
+    pub fn prompt_on_unknown(&self) -> bool {
+        *self == ThreatMode::Paranoid
+    }
+}
+
+impl std::fmt::Display for ThreatMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThreatMode::Moderate   => write!(f, "MODERATE"),
+            ThreatMode::Aggressive => write!(f, "AGGRESSIVE"),
+            ThreatMode::Paranoid   => write!(f, "PARANOID"),
+        }
+    }
+}
+
+impl std::str::FromStr for ThreatMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "moderate"   => Ok(ThreatMode::Moderate),
+            "aggressive" => Ok(ThreatMode::Aggressive),
+            "paranoid"   => Ok(ThreatMode::Paranoid),
+            _ => Err(format!("unknown mode '{}' — use moderate/aggressive/paranoid", s)),
+        }
+    }
+}
