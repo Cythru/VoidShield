@@ -9,6 +9,7 @@
 //!   voidshield quarantine restore  Restore a quarantined file
 
 mod firewall;
+mod assessment;
 mod notifier;
 mod oracle;
 mod quarantine;

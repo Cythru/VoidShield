@@ -1,0 +1,258 @@
+// assessment.bm — AccurateAssessment module
+// Calibrated estimates for build times, error triage, threat severity.
+// PERT distribution + Monte Carlo (10k samples, xorshift64 — no rand crate).
+// Reports confidence honestly: point estimate | range | "insufficient data".
+// Luke Saunderson / VoidShield — 2026
+
+// ─── PERT time estimate ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Pert {
+    pub optimistic:  f64,   // best case (seconds)
+    pub likely:      f64,   // realistic case
+    pub pessimistic: f64,   // worst case
+}
+
+impl Pert {
+    pub fn expected(&self) -> f64 {
+        (self.optimistic + 4.0 * self.likely + self.pessimistic) / 6.0
+    }
+
+    pub fn std_dev(&self) -> f64 {
+        (self.pessimistic - self.optimistic) / 6.0
+    }
+
+    pub fn p95(&self) -> f64 {
+        self.expected() + 1.645 * self.std_dev()
+    }
+}
+
+// ─── Confidence output ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Confidence {
+    /// Enough data, low variance — give a number
+    Point(f64),
+    /// Moderate data — give a range
+    Range { center: f64, low: f64, high: f64 },
+    /// Too little data — honest "don't know"
+    Insufficient { rough_low: f64, rough_high: f64 },
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Confidence::Point(v) =>
+                write!(f, "{:.1}s", v),
+            Confidence::Range { center, low, high } =>
+                write!(f, "{:.1}s (range {:.1}–{:.1}s, 95% CI)", center, low, high),
+            Confidence::Insufficient { rough_low, rough_high } =>
+                write!(f, "insufficient data — rough estimate {:.0}–{:.0}s", rough_low, rough_high),
+        }
+    }
+}
+
+pub fn confidence_from_samples(mean: f64, std_dev: f64, n: usize) -> Confidence {
+    let cv = if mean > 0.0 { std_dev / mean } else { 1.0 };
+    match n {
+        0..=2 => Confidence::Insufficient {
+            rough_low:  mean * 0.4,
+            rough_high: mean * 3.0,
+        },
+        3..=9 => {
+            let hw = 1.96 * std_dev;
+            Confidence::Range { center: mean, low: (mean - hw).max(0.0), high: mean + hw }
+        }
+        _ if cv < 0.2 => Confidence::Point(mean),
+        _ => {
+            let hw = std_dev;
+            Confidence::Range { center: mean, low: (mean - hw).max(0.0), high: mean + hw }
+        }
+    }
+}
+
+// ─── Monte Carlo ──────────────────────────────────────────────────────────────
+
+/// xorshift64 — fast, no deps, good enough for simulation
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self { Rng(if seed == 0 { 0xdeadbeef } else { seed }) }
+
+    fn next_f64(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Box-Muller normal sample
+    fn normal(&mut self, mean: f64, std_dev: f64) -> f64 {
+        let u1 = -(self.next_f64() + 1e-10).ln();
+        let u2 = self.next_f64() * std::f64::consts::TAU;
+        let z = (2.0 * u1).sqrt() * u2.cos();
+        (mean + std_dev * z).max(0.01)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SimResult {
+    pub median: f64,
+    pub p95:    f64,
+    pub mean:   f64,
+}
+
+/// Run Monte Carlo over a list of PERT tasks. 10k iterations.
+pub fn simulate(tasks: &[Pert]) -> SimResult {
+    const N: usize = 10_000;
+    let mut rng = Rng::new(0xc0ffee42);
+    let mut totals = Vec::with_capacity(N);
+
+    for _ in 0..N {
+        let t: f64 = tasks.iter()
+            .map(|p| rng.normal(p.expected(), p.std_dev()))
+            .sum();
+        totals.push(t);
+    }
+
+    totals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    SimResult {
+        median: totals[N / 2],
+        p95:    totals[N * 95 / 100],
+        mean:   totals.iter().sum::<f64>() / N as f64,
+    }
+}
+
+// ─── Build time estimation ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct BuildInput {
+    pub file_count:       usize,
+    pub dep_graph_depth:  usize,
+    pub total_loc:        usize,
+    pub history:          Vec<f64>, // previous build times in seconds
+}
+
+pub struct BuildEstimate {
+    pub confidence: Confidence,
+    pub breakdown:  String,
+}
+
+pub fn estimate_build(input: &BuildInput) -> BuildEstimate {
+    // Parametric baseline (ARM64 mobile calibrated):
+    // ~0.3s per file, +1.5s per dep depth level, +0.8s per 1k LOC
+    let parametric = input.file_count as f64 * 0.3
+        + input.dep_graph_depth as f64 * 1.5
+        + (input.total_loc as f64 / 1000.0) * 0.8;
+
+    let (mean, std_dev, n) = if !input.history.is_empty() {
+        let m = input.history.iter().sum::<f64>() / input.history.len() as f64;
+        let v = input.history.iter().map(|x| (x - m).powi(2)).sum::<f64>()
+            / input.history.len() as f64;
+        (m, v.sqrt(), input.history.len())
+    } else {
+        // no history — use parametric with wide variance
+        (parametric, parametric * 0.4, 0)
+    };
+
+    let conf = confidence_from_samples(mean, std_dev, n);
+    let breakdown = format!(
+        "files={} depth={} loc={} parametric={:.1}s history_samples={}",
+        input.file_count, input.dep_graph_depth, input.total_loc, parametric, n
+    );
+
+    BuildEstimate { confidence: conf, breakdown }
+}
+
+// ─── Error triage ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FixTime {
+    Seconds(u32),
+    Minutes(u32),
+    Unknown,
+}
+
+impl std::fmt::Display for FixTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FixTime::Seconds(s) => write!(f, "~{}s fix", s),
+            FixTime::Minutes(m) => write!(f, "~{}m fix", m),
+            FixTime::Unknown    => write!(f, "unknown fix time"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ErrorSignal {
+    pub blocks_compilation:  bool,
+    pub has_auto_fix:        bool,    // MachineApplicable suggestion
+    pub span_count:          usize,   // number of source locations involved
+    pub is_external_dep:     bool,    // error in dependency, not our code
+    pub is_structural:       bool,    // requires refactor, not mechanical fix
+}
+
+pub fn triage_error(sig: &ErrorSignal) -> FixTime {
+    let mut score: i32 = 0;
+    if sig.blocks_compilation  { score += 5; }
+    if sig.is_structural       { score += 5; }
+    if sig.span_count > 1      { score += 3; }
+    if sig.has_auto_fix        { score -= 5; }
+    if sig.is_external_dep     { score += 4; }
+
+    match score {
+        i32::MIN..=-1 => FixTime::Seconds(30),
+        0..=4         => FixTime::Seconds(120),
+        5..=9         => FixTime::Minutes(5),
+        _             => FixTime::Minutes(30),
+    }
+}
+
+// ─── Threat severity assessment ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThreatSeverity {
+    Critical,   // act now
+    High,       // act this session
+    Medium,     // log and monitor
+    Low,        // informational
+}
+
+impl std::fmt::Display for ThreatSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ThreatSeverity::Critical => write!(f, "CRITICAL"),
+            ThreatSeverity::High     => write!(f, "HIGH"),
+            ThreatSeverity::Medium   => write!(f, "MEDIUM"),
+            ThreatSeverity::Low      => write!(f, "LOW"),
+        }
+    }
+}
+
+pub fn assess_threat(threat_names: &[String], entropy: f64, size: u64) -> ThreatSeverity {
+    let has_sig_match  = threat_names.iter().any(|t| t.starts_with("SHA256:") || t.starts_with("MD5:") || t.starts_with("Pattern:"));
+    let has_rootkit    = threat_names.iter().any(|t| t.contains("Root") || t.contains("root"));
+    let has_injection  = threat_names.iter().any(|t| t.contains("Injection") || t.contains("ReverseShell"));
+    let high_entropy   = entropy > 7.2;
+    let tiny_binary    = size < 1024 && threat_names.iter().any(|t| t.starts_with("Heuristic:"));
+
+    if has_sig_match && (has_injection || has_rootkit) { return ThreatSeverity::Critical; }
+    if has_rootkit || has_injection                    { return ThreatSeverity::High; }
+    if has_sig_match                                   { return ThreatSeverity::High; }
+    if high_entropy && tiny_binary                     { return ThreatSeverity::High; }
+    if !threat_names.is_empty()                        { return ThreatSeverity::Medium; }
+    ThreatSeverity::Low
+}
+
+// ─── Quick project scan estimate ─────────────────────────────────────────────
+
+/// Estimate how long a cargo check will take given project stats.
+pub fn estimate_cargo_check(file_count: usize, dep_count: usize) -> Confidence {
+    // Calibrated on Pixel 10 Pro (Tensor G5 ARM64):
+    // ~0.25s per .rs/.bm file, ~0.4s per unique dep
+    let likely      = file_count as f64 * 0.25 + dep_count as f64 * 0.4;
+    let optimistic  = likely * 0.6;
+    let pessimistic = likely * 2.2;
+    let pert = Pert { optimistic, likely, pessimistic };
+    confidence_from_samples(pert.expected(), pert.std_dev(), 0)
+}
